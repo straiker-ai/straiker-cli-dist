@@ -1,0 +1,146 @@
+name: Straiker MCP scan
+description: Scan the MCP server(s) in this repository for security issues
+author: Straiker AI
+
+branding:
+  icon: shield
+  color: orange
+
+inputs:
+  pat:
+    description: >-
+      Straiker personal access token. Create one in the console under
+      Settings → API keys and store it as a repository secret.
+    required: true
+  paths:
+    description: >-
+      Directories to scan, one per line. Each must be a directory that could be
+      installed on its own — the scanner installs and launches the server from
+      the root of what it receives, and does not search subdirectories for a
+      manifest. Defaults to the repository root.
+    required: false
+    default: '.'
+  fail-on:
+    description: >-
+      Fail the job at this severity or above: critical, high, medium, or low.
+      Leave empty to report findings without failing.
+    required: false
+    default: high
+  intensity:
+    description: 'Scan depth: quick, standard, or deep.'
+    required: false
+    default: standard
+  version:
+    description: CLI version to install, e.g. v0.1.0. Defaults to the latest release.
+    required: false
+    default: ''
+  profile:
+    description: Straiker environment — prod, stage, or dev.
+    required: false
+    default: prod
+  exclude:
+    description: Globs to leave out of the upload, one per line.
+    required: false
+    default: ''
+  upload-artifact:
+    description: Upload the report bundle as a workflow artifact.
+    required: false
+    default: 'true'
+  artifact-name:
+    description: Name for the uploaded artifact.
+    required: false
+    default: straiker-results
+
+outputs:
+  exit-code:
+    description: 0 clean, 1 findings at or above the threshold, 2 a scan errored.
+    value: ${{ steps.scan.outputs.exit-code }}
+  results-dir:
+    description: Directory holding the report bundle and index.json.
+    value: straiker-results
+
+runs:
+  using: composite
+  steps:
+    - name: Install straiker
+      shell: bash
+      env:
+        STRAIKER_VERSION: ${{ inputs.version }}
+        # The runner's own bin directory is already on PATH and writable, which
+        # avoids needing sudo on every runner image.
+        STRAIKER_INSTALL: ${{ runner.temp }}/straiker-bin
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/straiker-ai/straiker-cli-dist/main/install.sh | sh
+        echo "${{ runner.temp }}/straiker-bin" >> "$GITHUB_PATH"
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        STRAIKER_PAT: ${{ inputs.pat }}
+        STRAIKER_PROFILE: ${{ inputs.profile }}
+      run: |
+        set -o pipefail
+
+        # Inputs arrive as newline-separated blocks. Blank lines and comments
+        # are dropped so a YAML block can be commented without breaking.
+        args=()
+        while IFS= read -r p; do
+          p="$(echo "$p" | xargs)"
+          [ -z "$p" ] && continue
+          case "$p" in \#*) continue ;; esac
+          args+=("$p")
+        done <<< "${{ inputs.paths }}"
+
+        if [ ${#args[@]} -eq 0 ]; then
+          echo "::error::no paths given"; exit 1
+        fi
+
+        for p in "${args[@]}"; do
+          if [ ! -d "$p" ]; then
+            echo "::error::path not found in the checkout: $p"; exit 1
+          fi
+        done
+
+        excludes=()
+        while IFS= read -r e; do
+          e="$(echo "$e" | xargs)"
+          [ -z "$e" ] && continue
+          excludes+=(--exclude "$e")
+        done <<< "${{ inputs.exclude }}"
+
+        failon=()
+        [ -n "${{ inputs.fail-on }}" ] && failon=(--fail-on "${{ inputs.fail-on }}")
+
+        # The scan's exit code is the step's exit code, so a failing scan is a
+        # red check with no extra wiring. It is captured first so the artifact
+        # upload below still runs.
+        set +e
+        straiker mcp scan "${args[@]}" \
+          --intensity "${{ inputs.intensity }}" \
+          "${failon[@]}" "${excludes[@]}" \
+          --summary "$GITHUB_STEP_SUMMARY" \
+          --out straiker-results \
+          --no-color
+        code=$?
+        set -e
+
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+
+        case $code in
+          0) echo "::notice::Straiker scan passed" ;;
+          1) echo "::error::Straiker found findings at or above ${{ inputs.fail-on }}" ;;
+          2) echo "::error::A scan errored — the verdict is unknown, not clean" ;;
+          3) echo "::error::Straiker CLI or authentication failure" ;;
+          *) echo "::error::Straiker exited $code" ;;
+        esac
+        exit $code
+
+    # always(): the report is most wanted precisely when the scan just failed.
+    - name: Upload report bundle
+      if: always() && inputs.upload-artifact == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: straiker-results/
+        if-no-files-found: warn
