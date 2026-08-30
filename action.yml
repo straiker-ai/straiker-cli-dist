@@ -116,12 +116,14 @@ runs:
         # red check with no extra wiring. It is captured first so the artifact
         # upload below still runs.
         set +e
+        # No --no-color: Actions renders ANSI, and the CLI detects CI and turns
+        # colour on while keeping its live cursor-driven view off. Set NO_COLOR
+        # in the workflow env to opt out.
         straiker mcp scan "${args[@]}" \
           --intensity "${{ inputs.intensity }}" \
           "${failon[@]}" "${excludes[@]}" \
           --summary "$GITHUB_STEP_SUMMARY" \
-          --out straiker-results \
-          --no-color
+          --out straiker-results
         code=$?
         set -e
 
