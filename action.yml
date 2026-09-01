@@ -38,6 +38,21 @@ inputs:
     description: Straiker environment — prod, stage, or dev.
     required: false
     default: prod
+  name:
+    description: >-
+      Name for the scanned artifact. This is the IDENTITY successive scans are
+      compared against, so keeping it stable is what makes drift between runs
+      visible — and changing it starts a fresh history. Two projects sharing a
+      name within one tenant collide into a single artifact.
+
+      Defaults to the repository, which is stable across runs and distinct from
+      a local `straiker mcp scan ./path` of the same code — that derives its
+      name from the directory, so the two no longer overwrite each other.
+
+      Applied only when scanning a single path; with several, each keeps its own
+      directory name so they stay separate artifacts.
+    required: false
+    default: ${{ github.repository }}
   exclude:
     description: Globs to leave out of the upload, one per line.
     required: false
@@ -112,6 +127,15 @@ runs:
         failon=()
         [ -n "${{ inputs.fail-on }}" ] && failon=(--fail-on "${{ inputs.fail-on }}")
 
+        # --name is ONE value for the whole invocation, so passing it alongside
+        # several paths would fold them all into a single artifact and have them
+        # supersede each other's verdicts. With more than one path, each keeps
+        # its own directory name instead.
+        name=()
+        if [ ${#args[@]} -eq 1 ] && [ -n "${{ inputs.name }}" ]; then
+          name=(--name "${{ inputs.name }}")
+        fi
+
         # The scan's exit code is the step's exit code, so a failing scan is a
         # red check with no extra wiring. It is captured first so the artifact
         # upload below still runs.
@@ -121,7 +145,7 @@ runs:
         # in the workflow env to opt out.
         straiker mcp scan "${args[@]}" \
           --intensity "${{ inputs.intensity }}" \
-          "${failon[@]}" "${excludes[@]}" \
+          "${name[@]}" "${failon[@]}" "${excludes[@]}" \
           --summary "$GITHUB_STEP_SUMMARY" \
           --out straiker-results
         code=$?
