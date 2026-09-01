@@ -74,11 +74,15 @@ analysis still runs, but the dynamic half of the scan silently does not.
 ### Outputs
 
 The run's summary page gets a table of servers and severity counts; the report
-bundle (`report.html`, `metadata.json`, `summary.json`, `result.sarif` per
-server, plus `index.json`) uploads as an artifact.
+bundle (`report.html`, `metadata.json`, `summary.json`, `preflight.json` per
+server, plus `index.json`) uploads as an artifact. `result.sarif` is included
+when the scan engine produced one — a re-scan of unchanged code reuses a cached
+verdict and writes no new SARIF, so pass `--force` if a pipeline needs it on
+every run.
 
 Exit codes: `0` clean · `1` findings at or above the threshold · `2` a scan
-errored, so the verdict is unknown · `3` CLI or auth failure.
+errored or its risk is `Unknown`, so the verdict is unknown · `3` CLI or auth
+failure.
 
 `2` outranking `1` is deliberate — findings are known bad, an error means we do
 not know, and not knowing is worse.
