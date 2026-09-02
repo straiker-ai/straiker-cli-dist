@@ -1,5 +1,5 @@
-name: Straiker MCP scan
-description: Scan the MCP server(s) in this repository for security issues
+name: Straiker scan
+description: Scan the MCP servers, model weights, or agent skills in this repository
 author: Straiker AI
 
 branding:
@@ -7,6 +7,17 @@ branding:
   color: orange
 
 inputs:
+  kind:
+    description: >-
+      What to scan: mcp, model, or skill. One engine each, and they take
+      different coordinates — an MCP server can be a directory, a repository, a
+      package or a live URL; a model is a hub id, an Ollama ref, a weights file
+      or a model directory; a skill is a directory, an archive or a repository.
+
+      Defaults to mcp, so a workflow written before models and skills existed
+      keeps working unchanged.
+    required: false
+    default: mcp
   pat:
     description: >-
       Straiker personal access token. Create one in the console under
@@ -14,10 +25,16 @@ inputs:
     required: true
   paths:
     description: >-
-      Directories to scan, one per line. Each must be a directory that could be
-      installed on its own — the scanner installs and launches the server from
-      the root of what it receives, and does not search subdirectories for a
-      manifest. Defaults to the repository root.
+      What to scan, one per line. Defaults to the repository root.
+
+      For kind: mcp each entry must be a directory that could be installed on
+      its own — the scanner installs and launches the server from the root of
+      what it receives, and does not search subdirectories for a manifest.
+
+      For kind: skill each entry is a skill directory or an archive.
+
+      For kind: model an entry may also be a coordinate rather than a path —
+      hf:org/model-name or ollama:llama3:8b — which Straiker fetches itself.
     required: false
     default: '.'
   fail-on:
@@ -27,7 +44,12 @@ inputs:
     required: false
     default: high
   intensity:
-    description: 'Scan depth: quick, standard, or deep.'
+    description: >-
+      Scan depth: quick, standard, or deep. APPLIES TO kind: mcp ONLY, and is
+      not sent for the others — it maps to the AI-pass knobs that only the MCP
+      scanner reads. The model scanner uses no LLM at all, and the skill
+      scanner's only switch is whether its AI pass runs. Passing it to either
+      is an error rather than a no-op, so this action drops it instead.
     required: false
     default: standard
   version:
@@ -94,8 +116,15 @@ runs:
       env:
         STRAIKER_PAT: ${{ inputs.pat }}
         STRAIKER_PROFILE: ${{ inputs.profile }}
+        STRAIKER_KIND: ${{ inputs.kind }}
       run: |
         set -o pipefail
+
+        kind="$(echo "$STRAIKER_KIND" | xargs)"
+        case "$kind" in
+          mcp|model|skill) ;;
+          *) echo "::error::kind must be mcp, model, or skill (got '$kind')"; exit 1 ;;
+        esac
 
         # Inputs arrive as newline-separated blocks. Blank lines and comments
         # are dropped so a YAML block can be commented without breaking.
@@ -108,12 +137,33 @@ runs:
         done <<< "${{ inputs.paths }}"
 
         if [ ${#args[@]} -eq 0 ]; then
-          echo "::error::no paths given"; exit 1
+          echo "::error::no targets given"; exit 1
         fi
 
+        # A coordinate is fetched by Straiker and is not expected on disk, so it
+        # skips the checkout test below. The CLI validates which coordinates each
+        # kind actually accepts — it holds the engine table — so this only sorts
+        # "look for it locally" from "hand it over".
+        is_coordinate() {
+          case "$1" in
+            hf:*|huggingface:*|ollama:*|npm:*|pypi:*|smithery:*|github:*|git@*|http://*|https://*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        uploads=0
         for p in "${args[@]}"; do
-          if [ ! -d "$p" ]; then
-            echo "::error::path not found in the checkout: $p"; exit 1
+          if is_coordinate "$p"; then continue; fi
+          uploads=$((uploads + 1))
+          if [ ! -e "$p" ]; then
+            echo "::error::not found in the checkout: $p"; exit 1
+          fi
+          # Only MCP requires a directory, and the reason is real: the scanner
+          # installs and launches the server from the root of what it receives.
+          # A model may be a single weights file and a skill may be an archive,
+          # so requiring a directory there would reject valid targets.
+          if [ "$kind" = "mcp" ] && [ ! -d "$p" ]; then
+            echo "::error::kind: mcp needs a directory, and $p is not one"; exit 1
           fi
         done
 
@@ -131,9 +181,23 @@ runs:
         # several paths would fold them all into a single artifact and have them
         # supersede each other's verdicts. With more than one path, each keeps
         # its own directory name instead.
+        #
+        # Withheld for a coordinate too. On an upload the name IS the artifact's
+        # identity and has to be stable; on a fetched coordinate it is only a
+        # display label, and forcing the repository name onto hf:org/model would
+        # label someone else's model with your repo.
         name=()
-        if [ ${#args[@]} -eq 1 ] && [ -n "${{ inputs.name }}" ]; then
+        if [ ${#args[@]} -eq 1 ] && [ $uploads -eq 1 ] && [ -n "${{ inputs.name }}" ]; then
           name=(--name "${{ inputs.name }}")
+        fi
+
+        # Dropped for model and skill rather than passed. Both refuse it — the
+        # model scanner has no LLM to tune and the skill scanner's only switch is
+        # --no-ai — so sending it would fail the job with a CLI error instead of
+        # scanning. See the intensity input's description.
+        intensity=()
+        if [ "$kind" = "mcp" ] && [ -n "${{ inputs.intensity }}" ]; then
+          intensity=(--intensity "${{ inputs.intensity }}")
         fi
 
         # The scan's exit code is the step's exit code, so a failing scan is a
@@ -143,9 +207,8 @@ runs:
         # No --no-color: Actions renders ANSI, and the CLI detects CI and turns
         # colour on while keeping its live cursor-driven view off. Set NO_COLOR
         # in the workflow env to opt out.
-        straiker mcp scan "${args[@]}" \
-          --intensity "${{ inputs.intensity }}" \
-          "${name[@]}" "${failon[@]}" "${excludes[@]}" \
+        straiker "$kind" scan "${args[@]}" \
+          "${intensity[@]}" "${name[@]}" "${failon[@]}" "${excludes[@]}" \
           --summary "$GITHUB_STEP_SUMMARY" \
           --out straiker-results
         code=$?
@@ -154,7 +217,7 @@ runs:
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
 
         case $code in
-          0) echo "::notice::Straiker scan passed" ;;
+          0) echo "::notice::Straiker $kind scan passed" ;;
           1) echo "::error::Straiker found findings at or above ${{ inputs.fail-on }}" ;;
           2) echo "::error::A scan errored — the verdict is unknown, not clean" ;;
           3) echo "::error::Straiker CLI or authentication failure" ;;
